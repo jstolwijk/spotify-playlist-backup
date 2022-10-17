@@ -22,86 +22,83 @@ var resources embed.FS
 
 var t = template.Must(template.ParseFS(resources, "templates/*"))
 
-const redirectURI = "/callback"
-
 var (
-	auth    = spotifyauth.New(spotifyauth.WithRedirectURL(redirectURI), spotifyauth.WithScopes(spotifyauth.ScopeUserReadPrivate, spotifyauth.ScopePlaylistReadCollaborative, spotifyauth.ScopePlaylistModifyPrivate, spotifyauth.ScopePlaylistReadPrivate))
 	state   = uuid.New().String()
-	baseUrl = "http://localhost:8080"
+	port    = getEnvOrFallback("PORT", "8080")
+	baseUrl = getEnvOrFallback("BASE_URL", "http://localhost:8080")
+	auth    = spotifyauth.New(spotifyauth.WithRedirectURL(baseUrl+"/callback"), spotifyauth.WithScopes(spotifyauth.ScopeUserReadPrivate, spotifyauth.ScopePlaylistReadCollaborative, spotifyauth.ScopePlaylistModifyPrivate, spotifyauth.ScopePlaylistReadPrivate))
 )
 
 func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-
-	bu := os.Getenv("BASE_URL")
-
-	if bu != "" {
-		baseUrl = bu
-	}
-
-	auth = spotifyauth.New(spotifyauth.WithRedirectURL(baseUrl+redirectURI), spotifyauth.WithScopes(spotifyauth.ScopeUserReadPrivate, spotifyauth.ScopePlaylistReadCollaborative, spotifyauth.ScopePlaylistModifyPrivate, spotifyauth.ScopePlaylistReadPrivate))
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		for _, cookie := range r.Cookies() {
-			if cookie.Name == "spotify" {
-				data := getData(cookie)
-
-				t.ExecuteTemplate(w, "index.logged-in.html.tmpl", data)
-				return
-			}
-		}
-
-		data := map[string]string{
-			"LoginUrl": auth.AuthURL(state),
-		}
-
-		t.ExecuteTemplate(w, "index.html.tmpl", data)
-	})
-
-	http.HandleFunc("/backup", func(w http.ResponseWriter, r *http.Request) {
-		for _, cookie := range r.Cookies() {
-			if cookie.Name == "spotify" {
-				tok := oauth2.Token{AccessToken: cookie.Value}
-				client := spotify.New(auth.Client(context.Background(), &tok))
-
-				user, err := client.CurrentUser(context.Background())
-
-				if err != nil {
-					log.Println("Error: ", err)
-					return
-				}
-
-				year, week := time.Now().ISOWeek()
-
-				playlists, err := client.Search(context.Background(), "Discover Weekly", spotify.SearchTypePlaylist)
-
-				if err != nil {
-					log.Println("Error: ", err)
-					return
-				}
-
-				if playlists.Playlists == nil || playlists.Playlists.Playlists == nil || len(playlists.Playlists.Playlists) == 0 {
-					log.Println("Error: ", err)
-					return
-				}
-
-				backupPlaylist(client, playlists.Playlists.Playlists[0].ID, fmt.Sprintf("Discover Weekly %d-%d", year, week), user.ID)
-
-				http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
-				return
-			}
-		}
-
-		http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
-	})
-
-	http.HandleFunc("/callback", completeAuth)
+	setupHandlers()
 
 	log.Println("listening on", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+func setupHandlers() {
+	http.HandleFunc("/", rootPath)
+
+	http.HandleFunc("/login", loginPath)
+	http.HandleFunc("/callback", completeAuthPath)
+
+	http.HandleFunc("/home", authenticated(homePath))
+	http.HandleFunc("/backup", authenticated(backupPath))
+}
+
+func getEnvOrFallback(name string, fallback string) string {
+	val := os.Getenv(name)
+
+	if val != "" {
+		return val
+	}
+
+	return fallback
+}
+
+func rootPath(w http.ResponseWriter, r *http.Request) {
+	cookie := getCookie(r)
+
+	if cookie != nil {
+		http.Redirect(w, r, "/home", http.StatusTemporaryRedirect)
+	} else {
+		http.Redirect(w, r, "/login", http.StatusTemporaryRedirect)
+	}
+}
+
+func homePath(w http.ResponseWriter, r *http.Request, cookie *http.Cookie) {
+	data := getData(cookie)
+	t.ExecuteTemplate(w, "index.logged-in.html.tmpl", data)
+}
+
+func backupPath(w http.ResponseWriter, r *http.Request, cookie *http.Cookie) {
+	tok := oauth2.Token{AccessToken: cookie.Value}
+	client := spotify.New(auth.Client(context.Background(), &tok))
+
+	user, err := client.CurrentUser(context.Background())
+
+	if err != nil {
+		log.Println("Error: ", err)
+		return
+	}
+
+	year, week := time.Now().ISOWeek()
+
+	playlists, err := client.Search(context.Background(), "Discover Weekly", spotify.SearchTypePlaylist)
+
+	if err != nil {
+		log.Println("Error: ", err)
+		return
+	}
+
+	if playlists.Playlists == nil || playlists.Playlists.Playlists == nil || len(playlists.Playlists.Playlists) == 0 {
+		log.Println("Error: ", err)
+		return
+	}
+
+	backupPlaylist(client, playlists.Playlists.Playlists[0].ID, fmt.Sprintf("Discover Weekly %d-%d", year, week), user.ID)
+
+	http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
 }
 
 func backupPlaylist(client *spotify.Client, playlistId spotify.ID, newPlaylistName string, userId string) {
@@ -116,15 +113,17 @@ func backupPlaylist(client *spotify.Client, playlistId spotify.ID, newPlaylistNa
 	if err != nil {
 		panic("Failed to create playlist")
 	}
-	trackPage, err := client.GetPlaylistTracks(ctx, playlistId)
+	items, err := client.GetPlaylistItems(ctx, playlistId)
 	if err != nil {
 		panic("Failed to get GetPlaylistTracks")
 	}
 
 	for page := 1; ; page++ {
 		var trackIds []spotify.ID
-		for _, track := range trackPage.Tracks {
-			trackIds = append(trackIds, track.Track.ID)
+		for _, item := range items.Items {
+			if item.Track.Track != nil {
+				trackIds = append(trackIds, item.Track.Track.ID)
+			}
 		}
 
 		_, err := client.AddTracksToPlaylist(ctx, newPlaylist.ID, trackIds...)
@@ -133,7 +132,7 @@ func backupPlaylist(client *spotify.Client, playlistId spotify.ID, newPlaylistNa
 			panic("Failed to add to playlist")
 		}
 
-		err = client.NextPage(ctx, trackPage)
+		err = client.NextPage(ctx, items)
 		if err != nil && err.Error() == "spotify: no more pages" {
 			break
 		}
@@ -156,34 +155,4 @@ func getData(cookie *http.Cookie) map[string]string {
 		"Region":   os.Getenv("FLY_REGION"),
 		"username": username,
 	}
-}
-
-func completeAuth(w http.ResponseWriter, r *http.Request) {
-	tok, err := auth.Token(r.Context(), state, r)
-	if err != nil {
-		http.Error(w, "Couldn't get token", http.StatusForbidden)
-		log.Println(err)
-		return
-	}
-	if st := r.FormValue("state"); st != state {
-		http.NotFound(w, r)
-		log.Printf("State mismatch: %s != %s\n", st, state)
-		return
-	}
-	// use the token to get an authenticated client
-	client := spotify.New(auth.Client(r.Context(), tok))
-
-	cookie := http.Cookie{
-		Name:    "spotify",
-		Value:   tok.AccessToken,
-		Path:    "/",
-		Domain:  baseUrl,
-		Expires: tok.Expiry,
-		Secure:  true,
-	}
-	http.SetCookie(w, &cookie)
-
-	client.CurrentUser(context.Background())
-
-	http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
 }
